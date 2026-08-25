@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import sys
 import re
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QEvent, QItemSelectionModel, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QKeySequence, QPen, QRegularExpressionValidator, QShortcut
 from PyQt6.QtCore import QRegularExpression
 from PyQt6.QtWidgets import QApplication, QAbstractItemView, QComboBox, QGraphicsRectItem, QGraphicsScene, QGraphicsTextItem, QGraphicsView, QGridLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMenu, QPushButton, QSizePolicy, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget
@@ -26,6 +26,8 @@ def parse_clock(value: str) -> int | None:
 class TimeEdit(QLineEdit):
     """A forgiving HH:MM field that helps while the user is still typing."""
     timeDragged = pyqtSignal()
+    advanceRequested = pyqtSignal()
+    escapeRequested = pyqtSignal()
     def __init__(self, value: str = ""):
         super().__init__(value)
         self.setValidator(QRegularExpressionValidator(QRegularExpression(r"\d{0,2}:?\d{0,2}"), self))
@@ -36,6 +38,8 @@ class TimeEdit(QLineEdit):
         self._drag_button: Qt.MouseButton | None = None
         self._time_dragging = False
         self._drag_fallback = None
+        self._active_component: int | None = None
+        self._pending_component: int | None = None
         self.setCursor(Qt.CursorShape.SizeHorCursor)
 
     def _set_text(self, value: str):
@@ -56,6 +60,81 @@ class TimeEdit(QLineEdit):
             hour, minute = (int(part) for part in match.groups())
             if parse_clock(f"{hour:02}:{minute:02}") is not None:
                 self._set_text(f"{hour:02}:{minute:02}")
+        self._pending_component = None
+
+    def _component_at_cursor(self, cursor: int) -> int | None:
+        if not re.fullmatch(r"\d{2}:\d{2}", self.text()):
+            return None
+        return 0 if cursor <= 2 else 3
+
+    def _select_component(self, component: int):
+        self._active_component = component
+        self._pending_component = None
+        self.setSelection(component, 2)
+
+    def focusInEvent(self, event):
+        super().focusInEvent(event)
+        if re.fullmatch(r"\d{2}:\d{2}", self.text()):
+            self._select_component(0)
+
+    def keyPressEvent(self, event):
+        text = self.text()
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self._finish()
+            self.editingFinished.emit()
+            self.advanceRequested.emit()
+            event.accept()
+            return
+        if event.key() == Qt.Key.Key_Escape:
+            self.escapeRequested.emit()
+            event.accept()
+            return
+        component = self._active_component if self._active_component is not None else self._component_at_cursor(self.cursorPosition())
+        digit = event.text() if event.text().isdigit() and len(event.text()) == 1 else None
+        if digit is not None and component is not None and re.fullmatch(r"\d{2}:\d{2}", text):
+            next_component = component
+            if self._pending_component == component:
+                pair = text[component + 1] + digit
+                self._pending_component = None
+            else:
+                pair = "0" + digit
+                self._pending_component = component
+            if component == 0:
+                if self._pending_component == component and int(digit) >= 3:
+                    # 03, 04 … are complete valid hours: continue at minutes.
+                    self._pending_component = None
+                    next_component = 3
+                elif self._pending_component is None:
+                    pair = f"{min(int(pair), 23):02}"
+                    next_component = 3
+            updated = text[:component] + pair + text[component + 2:]
+            self._set_text(updated)
+            self._active_component = next_component
+            self.setSelection(next_component, 2)
+            event.accept()
+            return
+        if event.key() in (Qt.Key.Key_Backspace, Qt.Key.Key_Delete) and ":" in text:
+            colon = text.index(":")
+            cursor = self.cursorPosition()
+            # Backspace at the separator removes the preceding digit, never
+            # the separator itself. Keep the field structurally editable.
+            if event.key() == Qt.Key.Key_Backspace and cursor in (colon, colon + 1):
+                remove = colon - 1
+                self._set_text(text[:remove] + text[remove + 1:])
+                self.setCursorPosition(remove)
+                event.accept()
+                return
+            if event.key() == Qt.Key.Key_Delete and cursor == colon:
+                remove = colon + 1
+                self._set_text(text[:remove] + text[remove + 1:])
+                self.setCursorPosition(colon)
+                event.accept()
+                return
+        if event.text() == ":" and ":" in text:
+            event.accept()
+            return
+        self._pending_component = None
+        super().keyPressEvent(event)
 
     def set_drag_fallback(self, fallback):
         """Set a callable used when this otherwise-empty field is dragged."""
@@ -100,8 +179,36 @@ class TimeEdit(QLineEdit):
             event.accept()
         else:
             super().mouseReleaseEvent(event)
+            component = self._component_at_cursor(self.cursorPosition())
+            if component is not None:
+                self._select_component(component)
         self._drag_origin_x = None
         self._drag_button = None
+
+class TypeCombo(QComboBox):
+    """Combo box that behaves like an editable table field on Enter/Escape."""
+    advanceRequested = pyqtSignal()
+    escapeRequested = pyqtSignal()
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key.Key_Up, Qt.Key.Key_Down) and not self.view().isVisible():
+            event.accept()
+            return
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            if not self.view().isVisible():
+                self.showPopup()
+            else:
+                self.hidePopup()
+                self.activated.emit(self.currentIndex())
+                self.advanceRequested.emit()
+            event.accept()
+            return
+        if event.key() == Qt.Key.Key_Escape:
+            self.hidePopup()
+            self.escapeRequested.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
 class TimelineView(QGraphicsView):
     """A single-row timeline reads naturally with a horizontal mouse wheel."""
@@ -149,12 +256,14 @@ class SegmentItem(QGraphicsRectItem):
             event.ignore(); return
         modifiers = event.modifiers()
         if event.button() == Qt.MouseButton.RightButton:
-            # A context action always acts on exactly the block under the menu.
-            self.window.controller.select(self.segment.source_id)
+            # Preserve a group only when the context target already belongs to it.
+            if self.segment.source_id not in self.window.controller.state.selected:
+                self.window.controller.select(self.segment.source_id)
         elif self.segment.source_id not in self.window.controller.state.selected or modifiers & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier):
             self.window.controller.select(self.segment.source_id,
                                           toggle=bool(modifiers & Qt.KeyboardModifier.ControlModifier),
                                           range_select=bool(modifiers & Qt.KeyboardModifier.ShiftModifier))
+        self.window.view.setFocus()
         self._drag_start = pointer_to_minute(event.scenePos().x())
         self._dragged = False
         self._fine_drag = event.button() == Qt.MouseButton.RightButton
@@ -222,14 +331,15 @@ class SegmentItem(QGraphicsRectItem):
                 action = menu.addAction(f"Change to {KINDS[kind].label}")
                 action.setData(kind.value)
             chosen = menu.exec(event.screenPos())
+            target_ids = self.window.controller.state.selected or frozenset({self.segment.source_id})
             if chosen is delete_action:
-                self.window.controller.delete({self.segment.source_id})
+                self.window.controller.delete(target_ids)
             elif chosen is fill_left:
-                self.window.controller.fill_gap(self.segment.source_id, "left")
+                self.window.controller.fill_selected_gaps(target_ids, "left")
             elif chosen is fill_right:
-                self.window.controller.fill_gap(self.segment.source_id, "right")
+                self.window.controller.fill_selected_gaps(target_ids, "right")
             elif chosen is not None and chosen.data() in {kind.value for kind in BlockKind}:
-                self.window.change_visible_kind(self._gesture_key, BlockKind(chosen.data()))
+                self.window.change_selected_kinds(target_ids, BlockKind(chosen.data()))
         else:
             self.window.controller.cancel_gesture()
         self._drag_start = None
@@ -241,9 +351,11 @@ class SegmentItem(QGraphicsRectItem):
 class TimelineWindow(QWidget):
     def __init__(self):
         super().__init__(); self.controller = TimelineController(); self.setWindowTitle("Docházka timeline")
+        QApplication.instance().installEventFilter(self)
+        self._handled_shortcut: tuple[int, Qt.KeyboardModifiers] | None = None
         self.setStyleSheet("""
             QWidget { background: #252b36; color: #e5e7eb; }
-            QPushButton { background: #3a4a61; color: #edf2f7; border: 1px solid #566b86; border-radius: 4px; padding: 6px 10px; font-weight: 600; }
+            QPushButton { background: #3a4a61; color: #edf2f7; border: 1px solid #566b86; border-radius: 4px; padding: 4px 7px; font-weight: 600; }
             QPushButton:hover { background: #465d79; }
             QPushButton:pressed { background: #304157; }
             QLineEdit, QComboBox { background: #313b4b; color: #f3f4f6; border: 1px solid #52647b; border-radius: 3px; padding: 3px; }
@@ -263,14 +375,16 @@ class TimelineWindow(QWidget):
         for label, action in [("Close gaps", self.controller.close_selected_gaps), ("Undo", self.controller.undo), ("Redo", self.controller.redo), ("Reset example", self.reset_all)]:
             b = QPushButton(label); b.clicked.connect(lambda _, f=action: self.command(f)); buttons.addWidget(b)
         timeline_panel.addLayout(buttons); timeline_panel.addWidget(self.view); self.status = QLabel(); timeline_panel.addWidget(self.status)
-        body.addLayout(timeline_panel, 2)
-        table_panel = QVBoxLayout(); table_panel.addWidget(QLabel("Attendance rows (strict overwrite)"))
+        body.addLayout(timeline_panel, 1)
+        table_container = QWidget(); table_container.setFixedWidth(380)
+        table_panel = QVBoxLayout(table_container); table_panel.setContentsMargins(4, 4, 4, 4); table_panel.setSpacing(4); table_panel.addWidget(QLabel("Attendance rows (strict overwrite)"))
         add_buttons = QGridLayout()
+        add_buttons.setHorizontalSpacing(4); add_buttons.setVerticalSpacing(4)
         for index, kind in enumerate(BlockKind):
             button = QPushButton(f"Add {KINDS[kind].label}")
             button.clicked.connect(lambda _, k=kind: self.add_table_row(k)); add_buttons.addWidget(button, index // 2, index % 2)
         table_panel.addLayout(add_buttons)
-        self.table = QTableWidget(0, 3); self.table.setHorizontalHeaderLabels(["Type", "Start", "End"]); self.table.setMinimumWidth(400)
+        self.table = QTableWidget(0, 3); self.table.setHorizontalHeaderLabels(["Type", "Start", "End"]); self.table.setMinimumWidth(0)
         self.table.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
@@ -282,15 +396,42 @@ class TimelineWindow(QWidget):
             shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
             shortcut.activated.connect(lambda d=direction: self.fill_selected_gap(d))
         table_panel.addWidget(self.table, 1)
-        body.addLayout(table_panel, 1); layout.addLayout(body); self.render()
+        body.addWidget(table_container, 0); layout.addLayout(body); self.render()
     def command(self, action): action(); self.render()
+    def eventFilter(self, watched, event):
+        if event.type() in (QEvent.Type.ShortcutOverride, QEvent.Type.KeyPress):
+            ctrl = bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier)
+            shift = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+            identity = (int(event.key()), event.modifiers())
+            if event.type() == QEvent.Type.KeyPress and self._handled_shortcut == identity:
+                self._handled_shortcut = None
+                return True
+            def handle(action):
+                QTimer.singleShot(0, action)
+                if event.type() == QEvent.Type.ShortcutOverride:
+                    self._handled_shortcut = identity
+                event.accept()
+                return True
+            if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+                focus = QApplication.focusWidget()
+                in_table = ((isinstance(watched, QWidget) and (watched is self.table or self.table.isAncestorOf(watched)))
+                            or (isinstance(focus, QWidget) and (focus is self.table or self.table.isAncestorOf(focus))))
+                if in_table and event.key() == Qt.Key.Key_Delete and self.table.selectionModel().selectedRows():
+                    return handle(self.delete_table_rows)
+                if not in_table:
+                    return handle(lambda: self.command(self.controller.delete))
+            if ctrl and not shift and event.key() == Qt.Key.Key_Z:
+                return handle(lambda: self.command(self.controller.undo))
+            if (ctrl and event.key() == Qt.Key.Key_Y) or (ctrl and shift and event.key() == Qt.Key.Key_Z):
+                return handle(lambda: self.command(self.controller.redo))
+        return super().eventFilter(watched, event)
     def reset_all(self):
         self._pending_rows.clear()
         self._table_drafts.clear()
         return self.controller.reset()
     def fill_selected_gap(self, direction: str):
-        if len(self.controller.state.selected) == 1:
-            self.command(lambda: self.controller.fill_gap(next(iter(self.controller.state.selected)), direction))
+        if self.controller.state.selected:
+            self.command(lambda: self.controller.fill_selected_gaps(self.controller.state.selected, direction))
     def defer_render(self):
         if not self._render_pending:
             self._render_pending = True
@@ -328,7 +469,7 @@ class TimelineWindow(QWidget):
         self._table_rows = rows
         self.table.setRowCount(len(rows))
         for row_index, data in enumerate(rows):
-            combo = QComboBox()
+            combo = TypeCombo()
             for kind in BlockKind: combo.addItem(KINDS[kind].label, kind.value)
             combo.setCurrentIndex(list(BlockKind).index(data["kind"]))
             draft = self._table_drafts.get(data.get("segment_key", ""))
@@ -336,13 +477,36 @@ class TimelineWindow(QWidget):
             end = TimeEdit(draft[1] if draft else data.get("end_text", clock(data["end"]) if isinstance(data["end"], int) else ""))
             end.set_drag_fallback(lambda box=start: parse_clock(box.text()))
             start.setPlaceholderText("HH:MM"); end.setPlaceholderText("HH:MM")
-            combo.currentIndexChanged.connect(lambda _, d=data, c=combo: self.table_type_changed(d, c))
+            combo.activated.connect(lambda _, d=data, c=combo: self.table_type_changed(d, c))
             start.editingFinished.connect(lambda d=data, c=combo, s=start, e=end: self.table_row_changed(d, c, s, e))
             end.editingFinished.connect(lambda d=data, c=combo, s=start, e=end: self.table_row_changed(d, c, s, e))
             start.timeDragged.connect(lambda d=data, c=combo, s=start, e=end: self.table_row_changed(d, c, s, e))
             end.timeDragged.connect(lambda d=data, c=combo, s=start, e=end: self.table_row_changed(d, c, s, e))
+            for widget in (combo, start, end):
+                widget.advanceRequested.connect(lambda w=widget: self.queue_table_advance(w))
+                widget.escapeRequested.connect(self.unfocus_table)
             self.table.setCellWidget(row_index, 0, combo); self.table.setCellWidget(row_index, 1, start); self.table.setCellWidget(row_index, 2, end)
         self._syncing_table = False
+        selected_rows = {index for index, data in enumerate(rows) if data.get("id") in self.controller.state.selected}
+        self.apply_table_row_highlights(selected_rows)
+
+    def queue_table_advance(self, widget):
+        position = next(((row, column) for row in range(self.table.rowCount()) for column in range(self.table.columnCount()) if self.table.cellWidget(row, column) is widget), None)
+        if position is not None:
+            QTimer.singleShot(0, lambda p=position: self.focus_next_table_control(*p))
+
+    def focus_next_table_control(self, row: int, column: int):
+        for index in range(row * self.table.columnCount() + column + 1, self.table.rowCount() * self.table.columnCount()):
+            widget = self.table.cellWidget(index // self.table.columnCount(), index % self.table.columnCount())
+            if widget is not None:
+                widget.setFocus()
+                return
+        self.unfocus_table()
+
+    def unfocus_table(self):
+        self.table.clearSelection()
+        self.table.clearFocus()
+        self.setFocus()
 
     def delete_table_rows(self):
         rows = sorted({index.row() for index in self.table.selectionModel().selectedRows()}, reverse=True)
@@ -358,9 +522,21 @@ class TimelineWindow(QWidget):
         self.render()
 
     def highlight_table_row(self, row: int):
-        self.table.selectRow(row)
+        data = self._table_rows[row]
+        self.apply_table_row_highlights({row})
+        source_id = data.get("id")
+        # Pending/invalid rows have no source ID and remain table-only.
+        if source_id and any(block.id == source_id for block in self.controller.state.blocks):
+            self.controller.select(source_id)
+            self.defer_render()
+
+    def apply_table_row_highlights(self, rows: set[int]):
+        self.table.clearSelection()
         for row_index in range(self.table.rowCount()):
-            selected = row_index == row
+            selected = row_index in rows
+            if selected:
+                index = self.table.model().index(row_index, 0)
+                self.table.selectionModel().select(index, QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows)
             for column in range(self.table.columnCount()):
                 widget = self.table.cellWidget(row_index, column)
                 if widget is not None:
@@ -396,6 +572,10 @@ class TimelineWindow(QWidget):
     def change_visible_kind(self, segment_key: str, kind: BlockKind):
         """Change from a widget/menu, then repaint after that event returns."""
         if self.controller.change_visible_kind(segment_key, kind):
+            self.defer_render()
+
+    def change_selected_kinds(self, source_ids, kind: BlockKind):
+        if self.controller.change_selected_kinds(source_ids, kind):
             self.defer_render()
 
     def _add_cursor(self, minute: int):
@@ -442,11 +622,5 @@ class TimelineWindow(QWidget):
             pos = self.view.mapFrom(self, event.position().toPoint()); point = self.view.mapToScene(pos)
             if TOP - 30 <= point.y() <= TOP + 65:
                 self.command(lambda: self.controller.set_cursor(pointer_to_minute(point.x())))
-    def keyPressEvent(self, event):
-        if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace): self.command(self.controller.delete); return
-        if event.matches(QKeySequence.StandardKey.Undo): self.command(self.controller.undo); return
-        if event.matches(QKeySequence.StandardKey.Redo) or (event.modifiers() & Qt.KeyboardModifier.ControlModifier and event.key() == Qt.Key.Key_Y): self.command(self.controller.redo); return
-        super().keyPressEvent(event)
-
 if __name__ == "__main__":
     application = QApplication(sys.argv); window = TimelineWindow(); window.show(); sys.exit(application.exec())

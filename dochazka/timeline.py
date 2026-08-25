@@ -199,6 +199,12 @@ def _merged_ranges(blocks: Iterable[Block]) -> list[tuple[int, int]]:
     return ranges
 
 
+def _cut_block(block: Block, start: int, end: int) -> list[Block]:
+    """Remove an interval from a block, preserving uncovered authored pieces."""
+    pieces = _masked(block.start_minute, block.end_minute, [Block(start, end, block.kind)])
+    return [Block(left, right, block.kind, block.id if index == 0 else uuid4().hex) for index, (left, right) in enumerate(pieces)]
+
+
 class TimelineController:
     """State owner, commands, history, and transient drag previews."""
     def __init__(self, state: TimelineState | None = None) -> None:
@@ -282,13 +288,26 @@ class TimelineController:
                 return False
             blocks = []
             for b in self.state.blocks:
-                if b.kind is not BlockKind.WORK or not _overlap(b.start_minute, b.end_minute, start, end):
+                if not _overlap(b.start_minute, b.end_minute, start, end):
                     blocks.append(b)
                     continue
-                blocks.extend(_split_work_for_break(b, Block(start, end, BlockKind.BREAK)))
+                if b.kind is BlockKind.WORK:
+                    blocks.extend(_split_work_for_break(b, Block(start, end, BlockKind.BREAK)))
+                else:
+                    # No special relation: insertion overwrites only the
+                    # intersecting portion of Vacation/Doctor/etc.
+                    blocks.extend(_cut_block(b, start, end))
             blocks.append(Block(start, end, kind))
         else:
-            blocks = [*self.state.blocks, Block(start, start + duration, kind)]
+            end = start + duration
+            targets = KINDS[kind].overwrite_targets
+            blocks = []
+            for block in self.state.blocks:
+                if block.kind in targets and _overlap(block.start_minute, block.end_minute, start, end):
+                    blocks.extend(_cut_block(block, start, end))
+                else:
+                    blocks.append(block)
+            blocks.append(Block(start, end, kind))
         self.message = ""
         return self._commit(self._replace_blocks(blocks))
 
@@ -303,7 +322,14 @@ class TimelineController:
         except ValueError as error:
             self.message = str(error)
             return False
-        blocks = [b for b in self.state.blocks if b.id != source_id and not _overlap(b.start_minute, b.end_minute, start, end)]
+        blocks: list[Block] = []
+        for block in self.state.blocks:
+            if block.id == source_id:
+                continue
+            if _overlap(block.start_minute, block.end_minute, start, end):
+                blocks.extend(_cut_block(block, start, end))
+            else:
+                blocks.append(block)
         blocks.append(replacement)
         self.message = ""
         return self._commit(self._replace_blocks(blocks, selected=frozenset({replacement.id}), selection_anchor=replacement.id))
@@ -320,10 +346,16 @@ class TimelineController:
             self.message = str(error)
             return False
         siblings = [item for item in self.projection.segments if item.source_id == segment.source_id and item.key != segment_key]
-        blocks = [block for block in self.state.blocks if block.id != segment.source_id and not _overlap(block.start_minute, block.end_minute, start, end)]
+        blocks: list[Block] = []
+        for block in self.state.blocks:
+            if block.id == segment.source_id:
+                continue
+            if _overlap(block.start_minute, block.end_minute, start, end):
+                blocks.extend(_cut_block(block, start, end))
+            else:
+                blocks.append(block)
         for sibling in siblings:
-            if not _overlap(sibling.start_minute, sibling.end_minute, start, end):
-                blocks.append(Block(sibling.start_minute, sibling.end_minute, sibling.kind))
+            blocks.extend(_cut_block(Block(sibling.start_minute, sibling.end_minute, sibling.kind), start, end))
         blocks.append(replacement)
         self.message = ""
         return self._commit(self._replace_blocks(blocks, selected=frozenset({replacement.id}), selection_anchor=replacement.id))
@@ -353,6 +385,20 @@ class TimelineController:
         blocks.append(Block(selected.start_minute, selected.end_minute, kind, source.id))
         self.message = ""
         return self._commit(self._replace_blocks(blocks, selected=frozenset({source.id}), selection_anchor=source.id))
+
+    def change_selected_kinds(self, source_ids: Iterable[str], kind: BlockKind) -> bool:
+        """Change several visible sources as one undoable action."""
+        before, history_start = self.state, len(self._undo)
+        changed = False
+        for source_id in source_ids:
+            key = next((segment.key for segment in self.projection.segments if segment.source_id == source_id), None)
+            if key is not None:
+                changed = self.change_visible_kind(key, kind) or changed
+        if changed:
+            del self._undo[history_start:]
+            self._undo.append(before)
+            self._redo.clear()
+        return changed
 
     def move(self, source_id: str, delta: int) -> bool:
         source = next((b for b in self.state.blocks if b.id == source_id), None)
@@ -590,6 +636,18 @@ class TimelineController:
             if boundary == block.end_minute: return False
             next_state = self._resized_state(source_id, "right", boundary)
         return self._commit(next_state)
+
+    def fill_selected_gaps(self, source_ids: Iterable[str], direction: str) -> bool:
+        """Fill each selected gap as one history action."""
+        before, history_start = self.state, len(self._undo)
+        changed = False
+        for source_id in source_ids:
+            changed = self.fill_gap(source_id, direction) or changed
+        if changed:
+            del self._undo[history_start:]
+            self._undo.append(before)
+            self._redo.clear()
+        return changed
 
     def reset(self) -> bool: return self._commit(TimelineState.example())
     def undo(self) -> bool:

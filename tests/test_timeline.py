@@ -102,6 +102,20 @@ def test_strict_table_edit_overwrites_overlaps_and_merges_work():
     assert c.replace_strict(c.state.blocks[0].id, BlockKind.WORK, 480, 600)
     assert [(b.start_minute, b.end_minute) for b in c.state.blocks] == [(480, 660)]
 
+def test_overwrite_cuts_only_covered_portion_of_existing_blocks():
+    work = Block(480, 960, BlockKind.WORK)
+    c = TimelineController(TimelineState((work,), 600))
+    assert c.add(BlockKind.VACATION)
+    assert [(b.kind, b.start_minute, b.end_minute) for b in c.state.blocks] == [
+        (BlockKind.WORK, 480, 600), (BlockKind.VACATION, 600, 840), (BlockKind.WORK, 840, 960)
+    ]
+    vacation = Block(600, 720, BlockKind.VACATION)
+    c = TimelineController(TimelineState((vacation,), 630))
+    assert c.add(BlockKind.BREAK)
+    assert [(b.kind, b.start_minute, b.end_minute) for b in c.state.blocks] == [
+        (BlockKind.VACATION, 600, 630), (BlockKind.BREAK, 630, 660), (BlockKind.VACATION, 660, 720)
+    ]
+
 def test_visible_table_edit_materialises_masked_work_fragments():
     work = Block(480, 960, BlockKind.WORK)
     vacation = Block(600, 720, BlockKind.VACATION)
@@ -174,3 +188,11 @@ def test_group_move_destructively_overwrites_unselected_blocks():
         (BlockKind.WORK, 170, 190), (BlockKind.BREAK, 210, 230),
         (BlockKind.DOCTOR, 200, 210), (BlockKind.DOCTOR, 230, 240)
     }
+
+def test_selected_kind_changes_are_batched_in_one_undo_step():
+    first, second = Block(100, 120, BlockKind.WORK), Block(200, 220, BlockKind.BREAK)
+    c = TimelineController(TimelineState((first, second), selected=frozenset({first.id, second.id})))
+    assert c.change_selected_kinds(c.state.selected, BlockKind.VACATION)
+    assert {block.kind for block in c.state.blocks} == {BlockKind.VACATION}
+    assert c.undo()
+    assert {block.kind for block in c.state.blocks} == {BlockKind.WORK, BlockKind.BREAK}
