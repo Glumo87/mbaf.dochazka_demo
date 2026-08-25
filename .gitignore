@@ -1,3 +1,13 @@
 *\*
 !*.py
 *
+!.gitignore
+!AGENTS.md
+!README.md
+!TIMELINE_SPEC.md
+!app.py
+!requirements.txt
+!dochazka/
+!dochazka/*.py
+!tests/
+!tests/*.py
