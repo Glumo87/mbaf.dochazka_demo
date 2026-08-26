@@ -29,10 +29,10 @@ class KindInfo:
 
 
 KINDS = {
-    BlockKind.WORK: KindInfo("Work", "#4d8ed8", 480),
-    BlockKind.BREAK: KindInfo("Break", "#e6a93d", 30),
-    BlockKind.VACATION: KindInfo("Vacation", "#63b879", 240, frozenset({BlockKind.WORK})),
-    BlockKind.DOCTOR: KindInfo("Doctor visit", "#ba72c9", 60, frozenset({BlockKind.WORK, BlockKind.BREAK, BlockKind.VACATION})),
+    BlockKind.WORK: KindInfo("Work", "#c96b25", 480),
+    BlockKind.BREAK: KindInfo("Break", "#6c6962", 30),
+    BlockKind.VACATION: KindInfo("Vacation", "#738456", 240, frozenset({BlockKind.WORK})),
+    BlockKind.DOCTOR: KindInfo("Doctor visit", "#98564c", 60, frozenset({BlockKind.WORK, BlockKind.BREAK, BlockKind.VACATION})),
 }
 
 
@@ -189,6 +189,18 @@ def _split_work_for_rightward_break_drop(work: Block, br: Block, previous_break:
     return pieces
 
 
+def _split_work_for_leftward_break_drop(work: Block, br: Block) -> list[Block]:
+    """Keep Work displaced by a leftward Break move on the Break's right."""
+    ws, we, bs, be = work.start_minute, work.end_minute, br.start_minute, br.end_minute
+    # The Break crossed the right edge of this Work fragment.  The covered
+    # minutes belong immediately after the new Break, not before the old
+    # Work start (which would make the entire shift appear to move left).
+    if ws < bs < we <= be:
+        overlap = we - bs
+        return [Block(ws, bs, BlockKind.WORK, work.id), Block(be, be + overlap, BlockKind.WORK)]
+    return _split_work_for_break(work, br)
+
+
 def _merged_ranges(blocks: Iterable[Block]) -> list[tuple[int, int]]:
     ranges: list[tuple[int, int]] = []
     for block in sorted(blocks):
@@ -248,6 +260,13 @@ class TimelineController:
     def set_cursor(self, minute: int) -> bool:
         return self._commit(replace(self.state, cursor_minute=max(0, min(DAY, minute)), selected=frozenset(), selection_anchor=None))
 
+    def replace_all(self, blocks: Iterable[Block], *, cursor_minute: int | None = None) -> bool:
+        """Replace one day's authored schedule in a single undoable command."""
+        return self._commit(TimelineState(
+            tuple(blocks),
+            self.state.cursor_minute if cursor_minute is None else max(0, min(DAY, cursor_minute)),
+        ))
+
     def select(self, source_id: str, *, toggle: bool = False, range_select: bool = False) -> bool:
         ids = [s.source_id for s in self.projection.segments]
         ids = list(dict.fromkeys(ids))
@@ -267,18 +286,28 @@ class TimelineController:
             self.message = "The new block would extend past midnight."
             return False
         if kind is BlockKind.WORK:
-            affected = [b for b in self.state.blocks if b.end_minute > start]
-            if any(b.end_minute + duration > DAY for b in affected):
-                self.message = "Work insertion would push time past midnight."
+            # Work occupies its normal [cursor, cursor + duration] window. It
+            # never shifts authored blocks; existing intervals are treated as
+            # obstacles and the new Work flows through the free portions of
+            # that window. Overlapped time is intentionally left untouched.
+            occupied = _merged_ranges(self.state.blocks)
+            pieces: list[tuple[int, int]] = []
+            window_end = start + duration
+            cursor = start
+            for left, right in occupied:
+                if right <= start or left >= window_end:
+                    continue
+                if left > cursor:
+                    pieces.append((cursor, min(left, window_end)))
+                cursor = max(cursor, right)
+                if cursor >= window_end:
+                    break
+            if cursor < window_end:
+                pieces.append((cursor, window_end))
+            if not pieces:
+                self.message = "The insertion window is already occupied."
                 return False
-            blocks: list[Block] = []
-            for b in self.state.blocks:
-                if b.start_minute >= start:
-                    blocks.append(replace(b, start_minute=b.start_minute + duration, end_minute=b.end_minute + duration))
-                elif b.end_minute > start:
-                    blocks.extend((replace(b, end_minute=start), Block(start + duration, b.end_minute + duration, b.kind)))
-                else: blocks.append(b)
-            blocks.append(Block(start, start + duration, kind))
+            blocks = [*self.state.blocks, *(Block(left, right, kind) for left, right in pieces)]
         elif kind is BlockKind.BREAK:
             end = start + duration
             affected = [b for b in self.state.blocks if b.kind is BlockKind.WORK and _overlap(b.start_minute, b.end_minute, start, end)]
@@ -487,6 +516,9 @@ class TimelineController:
             if overlay.kind is BlockKind.BREAK:
                 if moving_right and previous_overlay is not None:
                     blocks.extend(_split_work_for_rightward_break_drop(block, overlay, previous_overlay))
+                elif (previous_overlay is not None
+                      and overlay.start_minute < previous_overlay.start_minute):
+                    blocks.extend(_split_work_for_leftward_break_drop(block, overlay))
                 else:
                     blocks.extend(_split_work_for_break(block, overlay))
             else:

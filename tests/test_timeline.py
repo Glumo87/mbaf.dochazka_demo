@@ -1,3 +1,6 @@
+from datetime import date
+
+from dochazka.calendar_store import DayScheduleStore, DayType
 from dochazka.timeline import Block, BlockKind, TimelineController, TimelineState, project
 
 def test_default_and_cursor_creation():
@@ -9,10 +12,21 @@ def test_default_and_cursor_creation():
 def test_work_insertion_splits_and_rejects_midnight():
     c = TimelineController(TimelineState((Block(400, 800, BlockKind.WORK),), 600))
     assert c.add(BlockKind.WORK)
-    # The split pieces touch the inserted Work, so committed edits merge them.
-    assert sorted((b.start_minute, b.end_minute) for b in c.state.blocks) == [(400, 1280)]
+    # Existing Work is preserved; the free part of the insertion window joins it.
+    assert sorted((b.start_minute, b.end_minute) for b in c.state.blocks) == [(400, 1080)]
     c = TimelineController(TimelineState((Block(1000, 1200, BlockKind.BREAK),), 900))
-    assert not c.add(BlockKind.WORK)
+    assert c.add(BlockKind.WORK)
+    assert sorted((b.start_minute, b.end_minute) for b in c.state.blocks if b.kind is BlockKind.WORK) == [(900, 1000), (1200, 1380)]
+
+def test_work_insertion_flows_around_vacation_without_moving_it():
+    vacation = Block(660, 780, BlockKind.VACATION)
+    c = TimelineController(TimelineState((vacation,), 360))
+    assert c.add(BlockKind.WORK)
+    assert [(b.kind, b.start_minute, b.end_minute) for b in c.state.blocks] == [
+        (BlockKind.WORK, 360, 660),
+        (BlockKind.VACATION, 660, 780),
+        (BlockKind.WORK, 780, 840),
+    ]
 
 def test_break_splits_work_into_independent_authored_blocks():
     work = Block(480, 960, BlockKind.WORK)
@@ -62,6 +76,17 @@ def test_rightward_break_drag_fills_its_previous_path_with_work():
     c = TimelineController(TimelineState((br, work)))
     assert c.move(br.id, 60)
     assert [(b.start_minute, b.end_minute) for b in c.state.blocks if b.kind is BlockKind.WORK] == [(750, 810), (840, 960)]
+
+
+def test_leftward_break_drag_returns_displaced_work_to_break_right_side():
+    left = Block(480, 720, BlockKind.WORK)
+    br = Block(720, 750, BlockKind.BREAK)
+    right = Block(750, 990, BlockKind.WORK)
+    c = TimelineController(TimelineState((left, br, right)))
+    assert c.move(br.id, -4)
+    assert [(b.start_minute, b.end_minute) for b in c.state.blocks if b.kind is BlockKind.WORK] == [
+        (480, 716), (746, 990)
+    ]
 
 def test_work_move_overflows_through_break_and_skips_vacation():
     br = Block(720, 750, BlockKind.BREAK)
@@ -196,3 +221,71 @@ def test_selected_kind_changes_are_batched_in_one_undo_step():
     assert {block.kind for block in c.state.blocks} == {BlockKind.VACATION}
     assert c.undo()
     assert {block.kind for block in c.state.blocks} == {BlockKind.WORK, BlockKind.BREAK}
+
+
+def test_day_schedules_are_independent_and_keep_their_own_history():
+    monday = date(2026, 8, 24)
+    tuesday = date(2026, 8, 25)
+    store = DayScheduleStore(monday)
+    assert store.controller.replace_all((Block(480, 960, BlockKind.WORK),))
+    original = store.controller.state.blocks[0]
+    assert store.controller.move(original.id, 30)
+    monday_blocks = store.controller.state.blocks
+    store.select(tuesday)
+    assert store.controller.state.blocks == ()
+    assert store.controller.add(BlockKind.BREAK)
+    assert store.controller.undo()
+    assert store.controller.state.blocks == ()
+    store.select(monday)
+    assert store.controller.state.blocks == monday_blocks
+
+
+def test_new_day_is_empty_until_previous_schedule_is_explicitly_copied():
+    friday = date(2026, 8, 28)
+    monday = date(2026, 8, 31)
+    store = DayScheduleStore(friday)
+    assert store.controller.add(BlockKind.BREAK)
+    friday_blocks = store.controller.state.blocks
+    store.select(monday)
+    assert store.controller.state.blocks == ()
+    assert store.copy_previous_eligible(monday)
+    assert [(b.kind, b.start_minute, b.end_minute) for b in store.controller.state.blocks] == [
+        (b.kind, b.start_minute, b.end_minute) for b in friday_blocks
+    ]
+    assert {b.id for b in store.controller.state.blocks}.isdisjoint({b.id for b in friday_blocks})
+
+
+def test_explicit_copy_skips_prior_vacation_or_doctor_schedule():
+    monday = date(2026, 8, 24)
+    tuesday = date(2026, 8, 25)
+    wednesday = date(2026, 8, 26)
+    store = DayScheduleStore(monday)
+    assert store.controller.replace_all((Block(480, 900, BlockKind.WORK),))
+    store.select(tuesday)
+    assert store.controller.replace_all((Block(0, 1440, BlockKind.VACATION),))
+    store.select(wednesday)
+    assert store.controller.state.blocks == ()
+    assert store.copy_previous_eligible(wednesday)
+    assert [(b.kind, b.start_minute, b.end_minute) for b in store.controller.state.blocks] == [
+        (BlockKind.WORK, 480, 900)
+    ]
+
+
+def test_day_type_is_a_non_destructive_editing_flag():
+    monday = date(2026, 8, 24)
+    store = DayScheduleStore(monday)
+    original = store.controller.state
+    store.set_day_type(monday, DayType.VACATION)
+    assert store.day_type(monday) is DayType.VACATION
+    assert store.controller.state == original
+    store.set_day_type(monday, DayType.WORKDAY)
+    assert store.day_type(monday) is DayType.WORKDAY
+    assert store.controller.state == original
+
+
+def test_weekends_default_to_vacation_but_can_be_overridden_to_workday():
+    saturday = date(2026, 8, 29)
+    store = DayScheduleStore(saturday)
+    assert store.day_type(saturday) is DayType.VACATION
+    store.set_day_type(saturday, DayType.WORKDAY)
+    assert store.day_type(saturday) is DayType.WORKDAY
