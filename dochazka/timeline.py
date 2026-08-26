@@ -280,34 +280,24 @@ class TimelineController:
             selected = frozenset({source_id}); anchor = source_id
         return self._commit(replace(self.state, selected=selected, selection_anchor=anchor))
 
+    def preview_selection(self, source_ids: Iterable[str]) -> None:
+        """Change only the transient selected set, without adding history."""
+        visible_ids = {segment.source_id for segment in self.projection.segments}
+        selected = frozenset(source_id for source_id in source_ids if source_id in visible_ids)
+        anchor = next(iter(selected), None)
+        self.state = replace(self.state, selected=selected, selection_anchor=anchor)
+
     def add(self, kind: BlockKind) -> bool:
         start, duration = self.state.cursor_minute, KINDS[kind].default_duration
         if start + duration > DAY:
             self.message = "The new block would extend past midnight."
             return False
         if kind is BlockKind.WORK:
-            # Work occupies its normal [cursor, cursor + duration] window. It
-            # never shifts authored blocks; existing intervals are treated as
-            # obstacles and the new Work flows through the free portions of
-            # that window. Overlapped time is intentionally left untouched.
-            occupied = _merged_ranges(self.state.blocks)
-            pieces: list[tuple[int, int]] = []
-            window_end = start + duration
-            cursor = start
-            for left, right in occupied:
-                if right <= start or left >= window_end:
-                    continue
-                if left > cursor:
-                    pieces.append((cursor, min(left, window_end)))
-                cursor = max(cursor, right)
-                if cursor >= window_end:
-                    break
-            if cursor < window_end:
-                pieces.append((cursor, window_end))
-            if not pieces:
-                self.message = "The insertion window is already occupied."
-                return False
-            blocks = [*self.state.blocks, *(Block(left, right, kind) for left, right in pieces)]
+            end = start + duration
+            blocks = []
+            for block in self.state.blocks:
+                blocks.extend(_cut_block(block, start, end) if _overlap(block.start_minute, block.end_minute, start, end) else [block])
+            blocks.append(Block(start, end, kind))
         elif kind is BlockKind.BREAK:
             end = start + duration
             affected = [b for b in self.state.blocks if b.kind is BlockKind.WORK and _overlap(b.start_minute, b.end_minute, start, end)]
@@ -329,10 +319,9 @@ class TimelineController:
             blocks.append(Block(start, end, kind))
         else:
             end = start + duration
-            targets = KINDS[kind].overwrite_targets
             blocks = []
             for block in self.state.blocks:
-                if block.kind in targets and _overlap(block.start_minute, block.end_minute, start, end):
+                if _overlap(block.start_minute, block.end_minute, start, end):
                     blocks.extend(_cut_block(block, start, end))
                 else:
                     blocks.append(block)
@@ -389,31 +378,58 @@ class TimelineController:
         self.message = ""
         return self._commit(self._replace_blocks(blocks, selected=frozenset({replacement.id}), selection_anchor=replacement.id))
 
+    def preview_replace_visible_strict(self, segment_key: str, kind: BlockKind, start: int, end: int) -> bool:
+        """Preview an authoritative table edit without resize constraints."""
+        if self._gesture_start is None:
+            self.begin_gesture()
+        self.state = self._gesture_start
+        segment = next((item for item in self.projection.segments if item.key == segment_key), None)
+        if segment is None:
+            return False
+        try:
+            replacement = Block(start, end, kind, segment.source_id)
+        except ValueError:
+            return False
+        siblings = [item for item in self.projection.segments
+                    if item.source_id == segment.source_id and item.key != segment_key]
+        blocks: list[Block] = []
+        for block in self.state.blocks:
+            if block.id == segment.source_id:
+                continue
+            blocks.extend(_cut_block(block, start, end) if _overlap(block.start_minute, block.end_minute, start, end) else [block])
+        for sibling in siblings:
+            blocks.extend(_cut_block(Block(sibling.start_minute, sibling.end_minute, sibling.kind), start, end))
+        blocks.append(replacement)
+        self.state = TimelineState(tuple(blocks), self.state.cursor_minute,
+                                   frozenset({replacement.id}), replacement.id)
+        return True
+
     def change_visible_kind(self, segment_key: str, kind: BlockKind) -> bool:
-        """Change one visible block type without changing other visible ranges."""
+        """Change one visible block type using the same overwrite rules as insertion."""
         selected = next((item for item in self.projection.segments if item.key == segment_key), None)
         source = next((item for item in self.state.blocks if selected and item.id == selected.source_id), None)
         if selected is None or source is None:
             self.message = "That visible block is no longer available."
             return False
-        # Any source masked by this overlay is replaced by its currently
-        # visible fragments, so removing the overlay cannot resurrect hidden
-        # time. This is deliberately destructive only to the old hidden state.
-        affected_ids = {source.id}
-        if source.kind in (BlockKind.DOCTOR, BlockKind.VACATION):
-            targets = KINDS[source.kind].overwrite_targets
-            affected_ids.update(block.id for block in self.state.blocks if block.kind in targets and _overlap(block.start_minute, block.end_minute, source.start_minute, source.end_minute))
-        blocks = [block for block in self.state.blocks if block.id not in affected_ids]
-        seen_sources: set[str] = set()
-        for segment in self.projection.segments:
-            if segment.source_id not in affected_ids or segment.source_id == source.id:
+        if kind is not BlockKind.BREAK:
+            return self.replace_visible_strict(
+                segment_key, kind, selected.start_minute, selected.end_minute
+            )
+        replacement = Block(selected.start_minute, selected.end_minute, kind, source.id)
+        blocks: list[Block] = []
+        for block in self.state.blocks:
+            if block.id == source.id:
                 continue
-            segment_id = segment.source_id if segment.source_id not in seen_sources else uuid4().hex
-            seen_sources.add(segment.source_id)
-            blocks.append(Block(segment.start_minute, segment.end_minute, segment.kind, segment_id))
-        blocks.append(Block(selected.start_minute, selected.end_minute, kind, source.id))
+            if block.kind is BlockKind.WORK or not _overlap(
+                block.start_minute, block.end_minute, replacement.start_minute, replacement.end_minute
+            ):
+                blocks.append(block)
+            else:
+                blocks.extend(_cut_block(block, replacement.start_minute, replacement.end_minute))
+        blocks.append(replacement)
         self.message = ""
-        return self._commit(self._replace_blocks(blocks, selected=frozenset({source.id}), selection_anchor=source.id))
+        state = self._replace_blocks(blocks, selected=frozenset({source.id}), selection_anchor=source.id)
+        return self._commit(self._settle_overlay(state, source.id))
 
     def change_selected_kinds(self, source_ids: Iterable[str], kind: BlockKind) -> bool:
         """Change several visible sources as one undoable action."""
@@ -430,18 +446,12 @@ class TimelineController:
         return changed
 
     def move(self, source_id: str, delta: int) -> bool:
-        source = next((b for b in self.state.blocks if b.id == source_id), None)
-        if source is not None and source.kind is BlockKind.WORK and self.state.selected <= {source_id}:
-            next_state = self._move_work_with_overflow(source, delta)
-            if next_state is None:
-                self.message = "Not enough space to move Work past the blocking interval."
-                return False
-            return self._commit(next_state)
         moved = self._moved_state(source_id, delta)
         overlay_before = next((b for b in self.state.blocks if b.id == source_id), None)
         overlay_after = next((b for b in moved.blocks if b.id == source_id), None)
         moving_right = bool(overlay_before and overlay_after and overlay_after.start_minute > overlay_before.start_minute)
-        return self._commit(self._settle_overlay(moved, source_id, moving_right=moving_right, previous_overlay=overlay_before))
+        settled = self._settle_overlay(moved, source_id, moving_right=moving_right, previous_overlay=overlay_before)
+        return self._commit(replace(settled, blocks=_merge(settled.blocks)))
 
     def _move_work_with_overflow(self, work: Block, delta: int) -> TimelineState | None:
         """Move one Work interval, routing any blocked minutes beyond blockers."""
@@ -499,7 +509,7 @@ class TimelineController:
     def _settle_overlay(self, state: TimelineState, source_id: str | None, *, moving_right: bool = False, previous_overlay: Block | None = None) -> TimelineState:
         """Materialise Work pieces when a Break or Doctor is dropped on Work."""
         overlay = next((b for b in state.blocks if b.id == source_id), None)
-        if overlay is None or overlay.kind not in (BlockKind.BREAK, BlockKind.VACATION, BlockKind.DOCTOR):
+        if overlay is None or overlay.kind is not BlockKind.BREAK:
             return state
         affected = [b for b in state.blocks if b.kind is BlockKind.WORK and _overlap(b.start_minute, b.end_minute, overlay.start_minute, overlay.end_minute)]
         if not affected:
@@ -521,12 +531,6 @@ class TimelineController:
                     blocks.extend(_split_work_for_leftward_break_drop(block, overlay))
                 else:
                     blocks.extend(_split_work_for_break(block, overlay))
-            else:
-                # A Doctor visit overwrites its covered time without adding it.
-                if block.start_minute < overlay.start_minute:
-                    blocks.append(replace(block, end_minute=overlay.start_minute))
-                if overlay.end_minute < block.end_minute:
-                    blocks.append(Block(overlay.end_minute, block.end_minute, BlockKind.WORK))
         return TimelineState(_merge(blocks), state.cursor_minute, state.selected, state.selection_anchor)
 
     def move_segment(self, key: str, delta: int) -> bool:
@@ -562,13 +566,6 @@ class TimelineController:
         return chosen_id
 
     def _moved_state(self, source_id: str, delta: int) -> TimelineState:
-        source = next((b for b in self.state.blocks if b.id == source_id), None)
-        if source is not None and source.kind is BlockKind.WORK and self.state.selected <= {source_id}:
-            moved = self._move_work_with_overflow(source, delta)
-            if moved is None:
-                self.message = "Not enough space to move Work past the blocking interval."
-                return self.state
-            return moved
         ids = self.state.selected if source_id in self.state.selected else frozenset({source_id})
         chosen = [b for b in self.state.blocks if b.id in ids]
         if not chosen: return self.state
@@ -576,17 +573,21 @@ class TimelineController:
         moved = [replace(b, start_minute=b.start_minute + delta, end_minute=b.end_minute + delta) if b.id in ids else b for b in self.state.blocks]
         # During a drag the insertion cursor follows the leading selected block.
         cursor = min(b.start_minute for b in moved if b.id in ids)
-        if len(ids) > 1:
-            moved_group = [b for b in moved if b.id in ids]
-            # A group drag overwrites only the intersecting portion.  Preserve
-            # any left/right fragments, deleting a block only if fully covered.
-            overwritten: list[Block] = [b for b in moved if b.id in ids]
-            for block in (b for b in moved if b.id not in ids):
-                fragments = _masked(block.start_minute, block.end_minute, moved_group)
-                for index, (start, end) in enumerate(fragments):
-                    overwritten.append(Block(start, end, block.kind, block.id if index == 0 else uuid4().hex))
-            moved = overwritten
-        return self._replace_blocks(moved, cursor_minute=cursor)
+        moved_group = [b for b in moved if b.id in ids]
+        # Moving any normal block overwrites what it lands on. The one
+        # exception is Break over Work: leave Work intact here so
+        # _settle_overlay can stretch it around the moved Break.
+        overwritten: list[Block] = [b for b in moved if b.id in ids]
+        for block in (b for b in moved if b.id not in ids):
+            overlays = [item for item in moved_group if not (item.kind is BlockKind.BREAK and block.kind is BlockKind.WORK)]
+            fragments = _masked(block.start_minute, block.end_minute, overlays)
+            for index, (start, end) in enumerate(fragments):
+                overwritten.append(Block(start, end, block.kind, block.id if index == 0 else uuid4().hex))
+        moved = overwritten
+        # Keep overlapping Work blocks distinct during a live preview so the
+        # dragged item remains identifiable and its geometry stays accurate.
+        selected = frozenset(ids)
+        return TimelineState(tuple(moved), cursor, selected, next(iter(selected), None))
 
     def resize(self, source_id: str, edge: str, minute: int) -> bool:
         return self._commit(self._resized_state(source_id, edge, minute))
@@ -724,5 +725,6 @@ class TimelineController:
         after = next((b for b in self.state.blocks if b.id == settle_source_id), None)
         moving_right = bool(before and after and after.start_minute > before.start_minute)
         self.state = self._settle_overlay(self.state, settle_source_id, moving_right=moving_right, previous_overlay=before)
+        self.state = replace(self.state, blocks=_merge(self.state.blocks))
         if self._states_equal(start, self.state): return False
         self._undo.append(start); self._redo.clear(); return True

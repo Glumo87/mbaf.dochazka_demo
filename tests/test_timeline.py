@@ -9,23 +9,42 @@ def test_default_and_cursor_creation():
     assert c.state.blocks[0].start_minute == 60
     assert c.state.blocks[0].duration == 30
 
-def test_work_insertion_splits_and_rejects_midnight():
+def test_preview_selection_is_live_and_does_not_create_history():
+    first = Block(60, 120, BlockKind.WORK)
+    second = Block(180, 240, BlockKind.BREAK)
+    c = TimelineController(TimelineState((first, second)))
+    c.preview_selection((first.id, second.id))
+    assert c.state.selected == frozenset({first.id, second.id})
+    assert not c.can_undo
+    c.preview_selection((second.id,))
+    assert c.state.selected == frozenset({second.id})
+
+def test_work_preview_remains_visible_when_merging_right_block_leftward():
+    left = Block(480, 600, BlockKind.WORK)
+    right = Block(600, 720, BlockKind.WORK)
+    c = TimelineController(TimelineState((left, right), selected=frozenset({right.id})))
+    c.begin_gesture()
+    assert c.preview_move(right.id, -120)
+    assert c.state.selected == frozenset({right.id})
+    assert any(block.id == right.id and block.start_minute == 480 for block in c.state.blocks)
+    assert c.commit_gesture(right.id)
+    assert [(block.start_minute, block.end_minute) for block in c.state.blocks] == [(480, 600)]
+
+def test_work_insertion_overwrites_occupied_time():
     c = TimelineController(TimelineState((Block(400, 800, BlockKind.WORK),), 600))
     assert c.add(BlockKind.WORK)
-    # Existing Work is preserved; the free part of the insertion window joins it.
+    # Touching Work merges after the inserted interval is applied.
     assert sorted((b.start_minute, b.end_minute) for b in c.state.blocks) == [(400, 1080)]
     c = TimelineController(TimelineState((Block(1000, 1200, BlockKind.BREAK),), 900))
     assert c.add(BlockKind.WORK)
-    assert sorted((b.start_minute, b.end_minute) for b in c.state.blocks if b.kind is BlockKind.WORK) == [(900, 1000), (1200, 1380)]
+    assert sorted((b.start_minute, b.end_minute) for b in c.state.blocks if b.kind is BlockKind.WORK) == [(900, 1380)]
 
-def test_work_insertion_flows_around_vacation_without_moving_it():
+def test_work_insertion_overwrites_vacation():
     vacation = Block(660, 780, BlockKind.VACATION)
     c = TimelineController(TimelineState((vacation,), 360))
     assert c.add(BlockKind.WORK)
     assert [(b.kind, b.start_minute, b.end_minute) for b in c.state.blocks] == [
-        (BlockKind.WORK, 360, 660),
-        (BlockKind.VACATION, 660, 780),
-        (BlockKind.WORK, 780, 840),
+        (BlockKind.WORK, 360, 840),
     ]
 
 def test_break_splits_work_into_independent_authored_blocks():
@@ -88,24 +107,24 @@ def test_leftward_break_drag_returns_displaced_work_to_break_right_side():
         (480, 716), (746, 990)
     ]
 
-def test_work_move_overflows_through_break_and_skips_vacation():
+def test_work_move_overwrites_break_and_vacation():
     br = Block(720, 750, BlockKind.BREAK)
     work = Block(750, 780, BlockKind.WORK)
     c = TimelineController(TimelineState((br, work)))
     assert c.move(work.id, -15)
-    assert [(b.start_minute, b.end_minute) for b in c.state.blocks if b.kind is BlockKind.WORK] == [(705, 720), (750, 765)]
+    assert [(b.start_minute, b.end_minute) for b in c.state.blocks if b.kind is BlockKind.WORK] == [(735, 765)]
     vacation = Block(675, 720, BlockKind.VACATION)
     c = TimelineController(TimelineState((vacation, br, work)))
     assert c.move(work.id, -15)
-    assert [(b.start_minute, b.end_minute) for b in c.state.blocks if b.kind is BlockKind.WORK] == [(660, 675), (750, 765)]
+    assert [(b.start_minute, b.end_minute) for b in c.state.blocks if b.kind is BlockKind.WORK] == [(735, 765)]
 
-def test_work_overflow_extends_adjacent_work_instead_of_disappearing():
+def test_work_move_overwrites_a_break_without_moving_other_work():
     left = Block(720, 750, BlockKind.WORK)
     br = Block(750, 780, BlockKind.BREAK)
     right = Block(780, 960, BlockKind.WORK)
     c = TimelineController(TimelineState((left, br, right)))
     assert c.move(left.id, 15)
-    assert [(b.start_minute, b.end_minute) for b in c.state.blocks if b.kind is BlockKind.WORK] == [(735, 750), (780, 975)]
+    assert [(b.start_minute, b.end_minute) for b in c.state.blocks if b.kind is BlockKind.WORK] == [(735, 765), (780, 960)]
 
 def test_resizing_a_touching_boundary_moves_both_blocks():
     left = Block(480, 600, BlockKind.WORK)
@@ -186,14 +205,14 @@ def test_fill_gap_extends_selected_block_to_nearest_boundary():
     assert c.fill_gap(right.id, "left")
     assert [(b.start_minute, b.end_minute) for b in c.state.blocks if b.kind is BlockKind.BREAK] == [(540, 660)]
 
-def test_context_type_change_preserves_visible_work_around_doctor():
+def test_context_type_change_to_break_stretches_work():
     work = Block(480, 960, BlockKind.WORK)
     doctor = Block(600, 660, BlockKind.DOCTOR)
     c = TimelineController(TimelineState((work, doctor)))
     doctor_key = next(s.key for s in c.projection.segments if s.source_id == doctor.id)
     assert c.change_visible_kind(doctor_key, BlockKind.BREAK)
     assert [(s.kind, s.start_minute, s.end_minute) for s in c.projection.segments] == [
-        (BlockKind.WORK, 480, 600), (BlockKind.BREAK, 600, 660), (BlockKind.WORK, 660, 960)
+        (BlockKind.WORK, 480, 600), (BlockKind.BREAK, 600, 660), (BlockKind.WORK, 660, 1020)
     ]
 
 def test_kind_change_commits_when_the_block_is_already_selected():

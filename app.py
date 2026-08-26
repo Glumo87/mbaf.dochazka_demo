@@ -5,8 +5,8 @@ import sys
 import re
 import calendar as month_calendar
 from datetime import date, timedelta
-from PyQt6.QtCore import QEvent, QItemSelectionModel, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QColor, QFont, QKeySequence, QPen, QRegularExpressionValidator, QShortcut, QPainter
+from PyQt6.QtCore import QEvent, QItemSelectionModel, QRectF, Qt, QTimer, pyqtSignal
+from PyQt6.QtGui import QBrush, QColor, QFont, QKeySequence, QPen, QRegularExpressionValidator, QShortcut, QPainter
 from PyQt6.QtCore import QRegularExpression
 from PyQt6.QtWidgets import QApplication, QAbstractItemView, QComboBox, QGraphicsDropShadowEffect, QGraphicsRectItem, QGraphicsScene, QGraphicsTextItem, QGraphicsView, QGridLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMenu, QPushButton, QSizePolicy, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget
 
@@ -221,6 +221,14 @@ class TypeCombo(QComboBox):
 class TimelineView(QGraphicsView):
     """A single-row timeline reads naturally with a horizontal mouse wheel."""
     cursorRequested = pyqtSignal(object)
+    selectionStarted = pyqtSignal(object)
+    selectionMoved = pyqtSignal(object)
+    selectionFinished = pyqtSignal(object)
+
+    def __init__(self, scene, parent=None):
+        super().__init__(scene, parent)
+        self._selection_origin = None
+        self._selection_dragging = False
 
     def wheelEvent(self, event):
         delta = event.angleDelta().y() or event.angleDelta().x()
@@ -235,10 +243,36 @@ class TimelineView(QGraphicsView):
                     super().mousePressEvent(event)
                     return
                 item = item.parentItem()
-            self.cursorRequested.emit(event.position().toPoint())
+            self._selection_origin = event.position().toPoint()
+            self._selection_dragging = False
             event.accept()
             return
         super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._selection_origin is None:
+            super().mouseMoveEvent(event)
+            return
+        point = event.position().toPoint()
+        if not self._selection_dragging and (point - self._selection_origin).manhattanLength() >= 3:
+            self._selection_dragging = True
+            self.selectionStarted.emit(self._selection_origin)
+        if self._selection_dragging:
+            self.selectionMoved.emit(point)
+        event.accept()
+
+    def mouseReleaseEvent(self, event):
+        if self._selection_origin is None or event.button() != Qt.MouseButton.LeftButton:
+            super().mouseReleaseEvent(event)
+            return
+        origin, dragging = self._selection_origin, self._selection_dragging
+        self._selection_origin = None
+        self._selection_dragging = False
+        if dragging:
+            self.selectionFinished.emit(event.position().toPoint())
+        else:
+            self.cursorRequested.emit(origin)
+        event.accept()
 
 
 class TimelineEditorPanel(QWidget):
@@ -402,7 +436,12 @@ class SegmentItem(QGraphicsRectItem):
         boundaries = [0, 1440]
         for segment in self._snap_segments:
             if segment.source_id not in selected:
-                boundaries.extend((segment.start_minute, segment.end_minute))
+                # Do not stick to the neighbour's boundary that we started
+                # against; crossing it is what lets adjacent blocks merge.
+                boundaries.extend(
+                    boundary for boundary in (segment.start_minute, segment.end_minute)
+                    if boundary not in (self._gesture_segment.start_minute, self._gesture_segment.end_minute)
+                )
         corrections = [boundary - edge for edge in (start, end) for boundary in boundaries if abs(boundary - edge) <= SNAP_MINUTES]
         return delta + min(corrections, key=abs) if corrections else delta
 
@@ -1010,9 +1049,14 @@ class TimelineWindow(QWidget):
             QScrollBar::handle:vertical:hover { background: #a99a86; }
             QScrollBar:horizontal { background: transparent; height: 12px; margin: 2px 5px; }
             QScrollBar::handle:horizontal { background: #c5b8a6; border-radius: 5px; min-width: 28px; }
+            #editorTimeline QScrollBar:horizontal { background: #d5cabc; border: 1px solid #a99987; border-radius: 5px; }
+            #editorTimeline QScrollBar::handle:horizontal { background: #806b55; border: 1px solid #5f4d3c; border-radius: 4px; min-width: 32px; }
+            #editorTimeline QScrollBar::handle:horizontal:hover { background: #694f39; }
             QScrollBar::add-line, QScrollBar::sub-line { width: 0; height: 0; }
         """)
-        self.scene = QGraphicsScene(self); self.view = TimelineView(self.scene); self.view.setObjectName("editorTimeline"); self.view.setMinimumWidth(720); self.view.setFixedHeight(150); self.view.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff); self.view.cursorRequested.connect(self.set_cursor_from_view); self._render_pending = False
+        self.scene = QGraphicsScene(self); self.view = TimelineView(self.scene); self.view.setObjectName("editorTimeline"); self.view.setMinimumWidth(720); self.view.setFixedHeight(150); self.view.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff); self.view.cursorRequested.connect(self.set_cursor_from_view); self.view.selectionStarted.connect(self.begin_timeline_selection); self.view.selectionMoved.connect(self.update_timeline_selection); self.view.selectionFinished.connect(self.finish_timeline_selection); self._render_pending = False
+        self._selection_origin = None
+        self._selection_window: QGraphicsRectItem | None = None
         self._center_timeline_on_open = False
         self._syncing_table = False; self._pending_rows: list[dict] = []; self._table_drafts: dict[str, tuple[str, str]] = {}
         self._table_preview_gesture: str | None = None
@@ -1127,6 +1171,13 @@ class TimelineWindow(QWidget):
             # Miniature day timelines are intentionally committed to the
             # ledger only when editing ends, not after each keystroke/drag.
             self.month_overview.refresh()
+            # Closing a non-modal sheet must return keyboard navigation to
+            # the ledger it overlays. Queue this after the hide/refresh so Qt
+            # cannot leave focus on a now-hidden editor button.
+            QTimer.singleShot(0, self.focus_month_ledger)
+
+    def focus_month_ledger(self):
+        self.month_overview.table.setFocus(Qt.FocusReason.OtherFocusReason)
 
     def _layout_editor_sheet(self):
         """Anchor the non-modal day editor to the bottom without moving the ledger."""
@@ -1158,6 +1209,53 @@ class TimelineWindow(QWidget):
     def set_cursor_from_panel(self, panel_pos):
         view_pos = self.view.mapFrom(self.timeline_panel, panel_pos)
         self.set_cursor_from_view(view_pos)
+
+    def begin_timeline_selection(self, view_pos):
+        """Start a rubber-band selection from empty timeline space."""
+        self._selection_origin = self.view.mapToScene(view_pos)
+        self.controller.preview_selection(())
+        self._selection_window = QGraphicsRectItem()
+        self._selection_window.setPen(QPen(QColor("#a95820"), 1, Qt.PenStyle.DashLine))
+        self._selection_window.setBrush(QBrush(QColor(215, 123, 50, 45)))
+        self._selection_window.setZValue(5)
+        self._selection_window.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        self.scene.addItem(self._selection_window)
+        self._apply_timeline_selection_preview()
+
+    def update_timeline_selection(self, view_pos):
+        if self._selection_origin is None or self._selection_window is None:
+            return
+        current = self.view.mapToScene(view_pos)
+        rectangle = QRectF(self._selection_origin, current).normalized()
+        self._selection_window.setRect(rectangle)
+        selected = {
+            item.segment.source_id
+            for item in self.scene.items()
+            if isinstance(item, SegmentItem) and rectangle.intersects(item.sceneBoundingRect())
+        }
+        self.controller.preview_selection(selected)
+        self._apply_timeline_selection_preview()
+        self.status.setText(f"{len(selected)} block{'s' if len(selected) != 1 else ''} selected")
+
+    def finish_timeline_selection(self, view_pos):
+        self.update_timeline_selection(view_pos)
+        if self._selection_window is not None:
+            self.scene.removeItem(self._selection_window)
+        self._selection_window = None
+        self._selection_origin = None
+
+    def _apply_timeline_selection_preview(self):
+        """Repaint selection without rebuilding the grabbed graphics scene."""
+        selected = self.controller.state.selected
+        for item in self.scene.items():
+            if isinstance(item, SegmentItem):
+                active = item.segment.source_id in selected
+                item.setPen(QPen(QColor("#57544e") if active else QColor("#403c36"), 3 if active else 1))
+        rows = {
+            index for index, data in enumerate(self._table_rows)
+            if data.get("id") in selected
+        }
+        self.apply_table_row_highlights(rows)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -1221,8 +1319,17 @@ class TimelineWindow(QWidget):
                               or (isinstance(focus, QWidget) and (focus is self.month_overview.table or self.month_overview.table.isAncestorOf(focus))))
             in_editor_input = (isinstance(focus, (QLineEdit, QComboBox))
                                and (focus is self.editor or self.editor.isAncestorOf(focus)))
+            in_timeline_side = ((isinstance(watched, QWidget) and (watched is self.timeline_panel or self.timeline_panel.isAncestorOf(watched)))
+                                or (isinstance(focus, QWidget) and (focus is self.timeline_panel or self.timeline_panel.isAncestorOf(focus))))
             if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and in_month_table:
                 return handle(self.open_selected_day_editor)
+            if (self._editor_visible and in_timeline_side and not in_editor_input
+                    and event.modifiers() == Qt.KeyboardModifier.NoModifier
+                    and event.key() in (Qt.Key.Key_Left, Qt.Key.Key_Right)):
+                step = -5 if event.key() == Qt.Key.Key_Left else 5
+                return handle(lambda: self.command(
+                    lambda: self.controller.set_cursor(self.controller.state.cursor_minute + step)
+                ))
             if event.key() == Qt.Key.Key_Escape and in_month_table and self._editor_visible:
                 return handle(lambda: self.set_editor_visible(False))
             # Escape is reserved for ending an edit while a time/type input has
@@ -1419,7 +1526,10 @@ class TimelineWindow(QWidget):
         if self._table_preview_gesture != data.get("segment_key"):
             self.controller.begin_gesture()
             self._table_preview_gesture = data.get("segment_key")
-        if not self.controller.preview_resize_visible(key, edge, minute):
+        preview_start = minute if edge == "left" else start
+        preview_end = end if edge == "left" else minute
+        if not self.controller.preview_replace_visible_strict(
+                key, BlockKind(combo.currentData()), preview_start, preview_end):
             return
         span = self._paint_selected_drag_preview()
         if span is None:
